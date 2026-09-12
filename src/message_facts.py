@@ -27,7 +27,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .ai_client import call_and_track
+from .ai_client import DEFAULT_MODEL, call_text_with_fallback
 
 FACT_TYPES = [
     "salary_amount_change",
@@ -130,9 +130,11 @@ def _save_cache(cache: dict):
 
 
 def _cache_key(message_id: str, text: str) -> str:
-    # Keyed on both id and text so an edited/replaced message_id in a
-    # future dataset run doesn't silently reuse a stale cached fact.
-    return f"{message_id}::{hash(text)}"
+    # Keyed on id, text, and model: an edited/replaced message_id in a
+    # future dataset run, or a switch to a different/fixed model (e.g.
+    # after a 404 misconfiguration), must not silently reuse a stale
+    # cached fact produced under different conditions.
+    return f"{message_id}::{hash(text)}::{DEFAULT_MODEL}"
 
 
 def extract_fact(message_id: str, user_id: str, text: str) -> MessageFact:
@@ -145,7 +147,7 @@ def extract_fact(message_id: str, user_id: str, text: str) -> MessageFact:
         return _fact_from_dict(message_id, user_id, text, cache[key])
 
     try:
-        response = call_and_track(
+        response = call_text_with_fallback(
             purpose="message_facts",
             max_tokens=300,
             messages=[
@@ -160,9 +162,11 @@ def extract_fact(message_id: str, user_id: str, text: str) -> MessageFact:
         if parsed.get("fact_type") not in FACT_TYPES:
             parsed["fact_type"] = "no_op"
     except RuntimeError:
-        # Missing/invalid API key -- a configuration error, not a
-        # per-message extraction failure. Must not be silently cached
-        # as a no_op fact; let it propagate so the pipeline stops.
+        # Missing/invalid GROQ_API_KEY, or both Groq and the local
+        # Ollama fallback failed -- a configuration/environment error,
+        # not a per-message extraction failure. Must not be silently
+        # cached as a no_op fact; let it propagate so the pipeline
+        # stops instead of mass-producing bogus no_ops.
         raise
     except Exception:  # noqa: BLE001 -- genuine per-call API/parsing failure -> safest fallback is no_op
         parsed = {

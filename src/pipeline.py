@@ -92,11 +92,12 @@ def process_request(row, profiles, events, messages, converter, payment_options_
 # writing. Update here if pricing changes; usage_report.md is
 # generated from these plus the actual token counts recorded by
 # ai_client.USAGE during the run, not hand-typed.
-# Only models this account's Groq key actually has access to (see
-# client.models.list()) are priced here. meta-llama/llama-4-scout and
-# llama-3.3-70b-versatile were removed after being confirmed
-# unavailable to this key (404 model_not_found) -- see
-# src/ai_client.py's VISION_MODEL comment.
+# Only cloud (Groq) models this account's key actually has access to
+# (see client.models.list()) are priced here. meta-llama/llama-4-scout
+# and llama-3.3-70b-versatile were removed after being confirmed
+# unavailable to this key (404 model_not_found). "ollama:*" models
+# (local fallback/default, see src/ai_client.py) are handled as $0
+# cost directly in write_usage_report below, not priced here.
 PRICING_PER_MILLION_TOKENS = {
     "openai/gpt-oss-120b": {"input": 0.15, "output": 0.60},
     "openai/gpt-oss-20b": {"input": 0.075, "output": 0.30},
@@ -107,11 +108,13 @@ def write_usage_report(path: str):
     summary = USAGE.summary()
     lines = ["# Token Usage and Cost Report", "", "## Summary", ""]
     lines.append(
-        "This run made real Groq API calls for image amount extraction "
-        "(`src/image_extraction.py`) and message fact extraction "
-        "(`src/message_facts.py`). All other computation -- the 90-day "
-        "balance forecast, affordability decision, and payment-plan "
-        "ranking -- is deterministic and makes no model calls."
+        "This run made real model calls for image amount extraction "
+        "(`src/image_extraction.py`, local Ollama) and message fact "
+        "extraction (`src/message_facts.py`, Groq primary with a local "
+        "Ollama fallback on failure). All other computation -- the "
+        "90-day balance forecast, affordability decision, and "
+        "payment-plan ranking -- is deterministic and makes no model "
+        "calls."
     )
     lines.append("")
     lines.append(
@@ -126,16 +129,23 @@ def write_usage_report(path: str):
     lines.append("## By model\n")
     lines.append("| Model | Calls | Input tokens | Output tokens | Est. cost |\n|---|---|---|---|---|")
     for model, stats in summary["by_model"].items():
-        pricing = PRICING_PER_MILLION_TOKENS.get(model)
-        if pricing:
-            cost = (
-                stats["input_tokens"] / 1_000_000 * pricing["input"]
-                + stats["output_tokens"] / 1_000_000 * pricing["output"]
-            )
+        if model.startswith("ollama:"):
+            # Local inference has no per-token API charge.
+            cost = 0.0
         else:
-            cost = None
+            pricing = PRICING_PER_MILLION_TOKENS.get(model)
+            if pricing:
+                cost = (
+                    stats["input_tokens"] / 1_000_000 * pricing["input"]
+                    + stats["output_tokens"] / 1_000_000 * pricing["output"]
+                )
+            else:
+                cost = None
         total_cost += cost or 0.0
-        cost_str = f"${cost:.4f}" if cost is not None else "unknown (pricing not on file)"
+        if model.startswith("ollama:"):
+            cost_str = "$0.0000 (local)"
+        else:
+            cost_str = f"${cost:.4f}" if cost is not None else "unknown (pricing not on file)"
         lines.append(
             f"| {model} | {stats['calls']} | {stats['input_tokens']:,} | "
             f"{stats['output_tokens']:,} | {cost_str} |"

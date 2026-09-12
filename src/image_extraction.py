@@ -23,7 +23,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .ai_client import VISION_MODEL, call_and_track
+from .ai_client import OLLAMA_VISION_MODEL, call_ollama
 
 EXTRACTION_PROMPT = """You are extracting a single financial figure from a photographed or \
 screenshotted receipt, invoice, bill, or payslip for a personal finance forecasting system.
@@ -76,36 +76,30 @@ def _media_type_for(path: str) -> str:
     }.get(ext, "image/png")
 
 
+def _cache_key(image_path: str) -> str:
+    # Keyed on model too, not just image path: switching
+    # OLLAMA_VISION_MODEL (e.g. to a bigger/different local model)
+    # must not silently reuse a result cached under a different model.
+    return f"{image_path}::{OLLAMA_VISION_MODEL}"
+
+
 def extract_amount_from_image(image_path: str) -> Optional[float]:
     """
-    Sends one receipt image to the model and returns the extracted
-    total amount, or None if the model couldn't find one / the call
-    fails. Results are cached on disk keyed by image path so repeat
-    pipeline runs against the same dataset don't re-call the API.
+    Sends one receipt image to a local Ollama vision model and returns
+    the extracted total amount, or None if the model couldn't find one
+    / the call fails. Ollama is the only path here -- this account's
+    Groq key has no vision-capable model available (see
+    src/ai_client.py's module docstring), so there's no cloud call to
+    try first. Results are cached on disk keyed by (image path, model)
+    so repeat pipeline runs against the same dataset/model don't
+    re-call the API.
     """
     cache = _load_cache()
-    if image_path in cache:
-        return cache[image_path]["amount"]
+    key = _cache_key(image_path)
+    if key in cache:
+        return cache[key]["amount"]
 
     if not os.path.exists(image_path):
-        return None
-
-    if VISION_MODEL is None:
-        # No vision-capable model is configured/available on this
-        # account's Groq key -- calling anyway would just 404 on every
-        # image and get masked by the except-block below as an
-        # ordinary per-call failure, silently corrupting these 16
-        # events' amounts with no visible signal. Surface it loudly
-        # once per image instead, but don't halt the whole pipeline --
-        # the caller (forecast.py) treats a None amount as unresolved
-        # and the run is expected to complete with this known gap.
-        print(
-            f"WARNING: no vision-capable model configured -- "
-            f"{image_path} amount left unresolved (None). Set "
-            f"BUY_OR_WAIT_VISION_MODEL once one is available."
-        )
-        cache[image_path] = {"amount": None}
-        _save_cache(cache)
         return None
 
     with open(image_path, "rb") as f:
@@ -114,9 +108,9 @@ def extract_amount_from_image(image_path: str) -> Optional[float]:
     media_type = _media_type_for(image_path)
 
     try:
-        response = call_and_track(
+        response = call_ollama(
             purpose="image_extraction",
-            model=VISION_MODEL,
+            model=OLLAMA_VISION_MODEL,
             max_tokens=200,
             messages=[
                 {
@@ -138,14 +132,15 @@ def extract_amount_from_image(image_path: str) -> Optional[float]:
         amount = parsed.get("amount")
         amount = float(amount) if amount is not None else None
     except RuntimeError:
-        # Missing/invalid API key -- this is a configuration error, not
-        # a per-image extraction failure, so it must not be silently
-        # swallowed into a cached "None" result. Let it propagate.
+        # Ollama isn't reachable / the model isn't pulled -- this is a
+        # configuration/environment error, not a per-image extraction
+        # failure, so it must not be silently swallowed into a cached
+        # "None" result. Let it propagate.
         raise
     except Exception:  # noqa: BLE001 -- genuine per-call API/parsing failure -> unresolved
         amount = None
 
-    cache[image_path] = {"amount": amount}
+    cache[key] = {"amount": amount}
     _save_cache(cache)
     return amount
 
