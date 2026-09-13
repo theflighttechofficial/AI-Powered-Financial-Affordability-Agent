@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .image_extraction_cache.json
 .message_facts_cache.json
+.claude/

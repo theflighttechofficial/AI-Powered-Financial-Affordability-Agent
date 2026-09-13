@@ -2,22 +2,22 @@
 
 ## Summary
 
-This run made real Groq API calls for image amount extraction (`src/image_extraction.py`) and message fact extraction (`src/message_facts.py`). All other computation -- the 90-day balance forecast, affordability decision, and payment-plan ranking -- is deterministic and makes no model calls.
+This run made real model calls for image amount extraction (`src/image_extraction.py`, local Ollama) and message fact extraction (`src/message_facts.py`, Groq primary with a local Ollama fallback on failure). All other computation -- the 90-day balance forecast, affordability decision, and payment-plan ranking -- is deterministic and makes no model calls.
 
 | Metric | Value |
 |---|---|
 | Total model calls | 198 |
 | Total input tokens | 155,224 |
-| Total output tokens | 45,169 |
-| Total tokens | 200,393 |
+| Total output tokens | 46,167 |
+| Total tokens | 201,391 |
 
 ## By model
 
 | Model | Calls | Input tokens | Output tokens | Est. cost |
 |---|---|---|---|---|
-| openai/gpt-oss-120b | 198 | 155,224 | 45,169 | $0.0504 |
+| openai/gpt-oss-120b | 198 | 155,224 | 46,167 | $0.0510 |
 
-**Estimated total cost: $0.0504**
+**Estimated total cost: $0.0510**
 **Average cost per request in this run: see per-request note below.**
 
 Note: image and message extraction calls are cached on disk (`.image_extraction_cache.json`, `.message_facts_cache.json`) keyed by image path / message content, so the counts above reflect a full cold run against this dataset -- a second run against the same dataset makes zero additional calls.

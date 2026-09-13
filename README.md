@@ -1,17 +1,20 @@
 # Buy or Wait — AI-Powered Financial Affordability Agent
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-20%20passed-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-21%20passed-brightgreen.svg)](#testing--verification)
 [![Provider](https://img.shields.io/badge/groq%20%2B%20ollama-orange.svg)](https://groq.com/)
 
 An intelligent financial affordability and balance-forecasting engine that evaluates whether a user can safely afford a requested purchase or financial commitment. The agent projects a 90-day cashflow timeline based on historical transaction data, processes unstructured inputs (receipt images and multi-lingual account messages) using AI models, and evaluates deterministic safety rules to recommend optimal payment plans.
 
-**Model routing:** message/text extraction uses **Groq** (`openai/gpt-oss-120b`) as primary, falling back to a **local Ollama** model only if Groq fails. Receipt/invoice **image** extraction goes straight to a **local Ollama** vision model (`llama3.2-vision` by default) -- this project's Groq account has no vision-capable model available, so there's no cloud path to try first for images. See [`src/ai_client.py`](src/ai_client.py) for the routing logic.
+**Model routing:** message/text extraction uses **Groq** (`openai/gpt-oss-120b`) as primary, falling back to a **local Ollama** model only if Groq fails. Receipt/invoice **image** extraction goes straight to a **local Ollama** vision model (`llava-phi3` by default, ~2.9GB) -- this project's Groq account has no vision-capable model available, so there's no cloud path to try first for images. `moondream` (~829MB, the smallest option) was tried first but is a confirmed dead end on this Ollama version -- it returns empty responses for every image prompt, a known upstream bug, not specific to this project. See [`src/ai_client.py`](src/ai_client.py) for the routing logic and details.
+
+**Only a `GROQ_API_KEY` is strictly required to get output.** If Ollama isn't installed/running, image-derived amounts are left unresolved (`None`) with a loud `WARNING` per image -- the run still completes and produces a full `output.csv`. See [Quick Start](#quick-start) below.
 
 ---
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Overview](#overview)
 - [System Architecture](#system-architecture)
 - [AI vs. Deterministic Core](#ai-vs-deterministic-core)
@@ -19,9 +22,46 @@ An intelligent financial affordability and balance-forecasting engine that evalu
 - [Module Breakdown](#module-breakdown)
 - [Installation & Setup](#installation--setup)
 - [How to Run](#how-to-run)
+- [Dataset Layout](#dataset-layout)
 - [Methodology & Algorithmic Design](#methodology--algorithmic-design)
 - [Testing & Verification](#testing--verification)
 - [Cost & Token Monitoring](#cost--token-monitoring)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Quick Start
+
+Minimal path from a fresh clone to a generated `output.csv`, in order:
+
+```bash
+# 1. Install Python dependencies (pandas, groq SDK, pytest)
+pip install -r requirements.txt
+
+# 2. Set your Groq API key (get one free at https://console.groq.com/keys)
+#    Required -- the pipeline halts immediately with a clear error if this is missing.
+echo "GROQ_API_KEY=gsk_your_actual_key_here" > .env
+#    (or: export GROQ_API_KEY=gsk_your_actual_key_here)
+
+# 3. (Recommended, optional) Install Ollama and pull the local vision model,
+#    so the 16 receipt-image amounts resolve instead of staying None.
+#    See https://ollama.com/download for your OS.
+ollama pull llava-phi3
+
+# 4. Run the test suite (no API key or Ollama needed -- all AI calls are mocked)
+python -m pytest tests/ -v
+# -> 21 passed
+
+# 5. Run the full pipeline against the real 250-request dataset
+python -m src.pipeline --dataset dataset --out output.csv
+# -> Wrote 250 rows to output.csv
+# -> Wrote usage report to evaluation/usage_report.md
+
+# 6. (Optional) Validate against the 25 known-correct sample answers
+python -m src.pipeline --dataset dataset --out sample_output.csv --requests-file sample_requests.csv
+```
+
+That's the whole flow. Step 3 is the only optional one -- skipping it does not break the run (see [Troubleshooting](#troubleshooting)), it just leaves the 16 image-derived amounts as `None`.
 
 ---
 
@@ -103,7 +143,7 @@ Security and financial safety are built into the extraction layer so that untrus
 - **Prompt Injection Defense**: Message extraction prompts explicitly instruct the model to treat content as untrusted data to classify, never as system instructions.
 - **Explicit Scam Classification**: Advance-fee scams (e.g. *"pay a release fee to claim your prize"*) are categorized as `income_scam` and discarded.
 - **Downstream Isolation**: Core modules ([`src/forecast.py`](src/forecast.py) and [`src/decision_engine.py`](src/decision_engine.py)) read only typed dataclasses and never inspect raw message strings.
-- **Fail-Closed Strategy**: API network or JSON parsing failures return safe defaults (`None` or `no_op`) to drop single ambiguous data points rather than guessing, but only after the Groq -> Ollama fallback path (text) or the Ollama call (images) has actually been attempted -- a config error (missing `GROQ_API_KEY`, or Ollama unreachable) is never silently absorbed into a fallback default; it halts the run immediately instead.
+- **Fail-Closed Strategy**: API network or JSON parsing failures return safe defaults (`None` or `no_op`) to drop single ambiguous data points rather than guessing, but only after the Groq -> Ollama fallback path (text) has actually been attempted. A missing `GROQ_API_KEY` is a fatal config error and halts the entire run immediately (checked before any request is processed). Ollama being unreachable is handled differently by design -- it's an anticipated environment gap (e.g. a grading sandbox with no local Ollama), not a bug, so it degrades to an unresolved (`None`) image amount with a loud `WARNING` per image instead of halting the run or silently caching the gap as a permanent result.
 
 ---
 
@@ -123,7 +163,8 @@ src/
   └── pipeline.py            End-to-end orchestration CLI wiring inputs -> AI extraction -> forecasting -> output.csv.
 
 tests/
-  └── test_forecast.py       Synthetic unit tests verifying timeline math, binary search safety, and spending adjustments.
+  ├── test_forecast.py       Synthetic unit tests verifying timeline math, binary search safety, and spending adjustments.
+  └── test_ai_extraction.py  Mocked-call tests for the Groq/Ollama routing, JSON-parsing robustness, and graceful degradation when Ollama is unavailable.
 
 evaluation/
   └── usage_report.md        Auto-generated token count and cost summary produced after each pipeline execution.
@@ -135,8 +176,8 @@ evaluation/
 
 ### Prerequisites
 - Python 3.10+
-- A valid [Groq API Key](https://console.groq.com/) (primary, text extraction)
-- [Ollama](https://ollama.com/) installed and running locally (required for image extraction; used as a fallback for text extraction if Groq fails)
+- A valid [Groq API Key](https://console.groq.com/keys) -- **required**. The pipeline checks for `GROQ_API_KEY` before processing any request and halts immediately with a clear error if it's missing.
+- [Ollama](https://ollama.com/download) installed and running locally -- **optional but recommended**. Used for all image extraction and as the text-extraction fallback if Groq fails. Without it, the 16 receipt-image amounts are left unresolved (`None`) with a `WARNING` per image; everything else in the run still completes normally.
 
 ### 1. Install Dependencies
 
@@ -147,7 +188,7 @@ pip install -r requirements.txt
 ### 2. Pull the local Ollama models
 
 ```bash
-ollama pull llama3.2-vision
+ollama pull llava-phi3
 ollama pull llama3.1:8b
 ```
 
@@ -171,7 +212,7 @@ Ollama is assumed to be reachable at `http://localhost:11434` with the models ab
 |---|---|---|
 | `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Local Ollama endpoint (OpenAI-compatible) |
 | `OLLAMA_TEXT_MODEL` | `llama3.1:8b` | Fallback text model when Groq fails |
-| `OLLAMA_VISION_MODEL` | `llama3.2-vision` | Vision model for receipt image extraction (always used -- no Groq path exists for images) |
+| `OLLAMA_VISION_MODEL` | `llava-phi3` | Vision model for receipt image extraction (always used -- no Groq path exists for images). `moondream` (~829MB, smaller) was tried first but returns empty responses on every image prompt -- a known Ollama/moondream bug, not project-specific -- so `llava-phi3` (~2.9GB) is the default instead. Override for a larger/more accurate model (e.g. `llama3.2-vision`, ~8GB) if needed. |
 | `BUY_OR_WAIT_MODEL` | `openai/gpt-oss-120b` | Primary Groq text model |
 | `BUY_OR_WAIT_MAX_RETRIES` | `5` | Groq SDK retry budget for 429/5xx before falling back to Ollama |
 
@@ -203,7 +244,29 @@ python -m src.pipeline --dataset dataset --out sample_output.csv --requests-file
 | `--usage-report` | `evaluation/usage_report.md` | Path where token usage and cost analysis report will be written. |
 
 ### Disk Caching
-AI calls are saved locally to `.image_extraction_cache.json` and `.message_facts_cache.json`, keyed by (input, model) so switching models invalidates only the affected entries. Subsequent runs on the same dataset/model execute instantaneously with **0 additional API calls**.
+AI calls are saved locally to `.image_extraction_cache.json` and `.message_facts_cache.json`, keyed by (input, model) so switching models invalidates only the affected entries. Subsequent runs on the same dataset/model execute instantaneously with **0 additional API calls**. An image left unresolved because Ollama was unavailable is deliberately *not* cached, so re-running after installing/starting Ollama will actually retry it.
+
+---
+
+## Dataset Layout
+
+`--dataset` (default `dataset/`) must contain:
+
+```
+dataset/
+  ├── requests.csv                  250 real requests to process (the default run target)
+  ├── sample_requests.csv           25 requests with known-correct reference answers, for validation
+  ├── financial_profiles.csv        per-user balance, minimum-balance floor, home currency
+  ├── financial_events.csv          transaction history; some rows have a blank `amount` (see below)
+  ├── messages.csv                  free-text account/payroll messages (EN / Bahasa Indonesia)
+  ├── images.csv                    maps a blank-amount financial_events row -> an image_id
+  ├── exchange_rates.csv            dated FX rate table
+  ├── request_payment_options.csv   available payment plans per request
+  └── media/images/
+        image_01.png ... image_16.png   the 16 receipt/invoice/payslip images images.csv points to
+```
+
+The 16 blank-`amount` rows in `financial_events.csv` are resolved via `images.csv`'s `related_event_id` -> `media/images/<image_id>.png` -> [`src/image_extraction.py`](src/image_extraction.py). If an image referenced in `images.csv` is missing from `media/images/`, or named/placed differently, that row's amount silently stays unresolved (`None`) -- the path and `.png` extension are hard-coded in [`src/image_extraction.py`](src/image_extraction.py) and [`src/pipeline.py`](src/pipeline.py), so an image at the wrong path is indistinguishable from "no image" rather than raising an error. `dataset/output.csv` is a pre-existing blank output-schema template checked into the repo (not generated by this pipeline, and not an input) -- ignore it; the pipeline writes its real output to `output.csv` at the repo root.
 
 ---
 
@@ -243,7 +306,7 @@ Run the test suite using `pytest`:
 python -m pytest tests/ -v
 ```
 
-The 9 unit tests in [`tests/test_forecast.py`](tests/test_forecast.py) test timeline construction, binary search cashflow bounds, minimum threshold enforcement, spending change overrides, and safe payment date discovery using synthetic timelines. The 11 unit tests in [`tests/test_ai_extraction.py`](tests/test_ai_extraction.py) mock the Groq/Ollama calls to test the Groq-primary/Ollama-fallback routing, image extraction's Ollama-only path, disk-cache invalidation on model change, and that a genuine config error (missing API key, Ollama unreachable) always propagates rather than being silently absorbed as a normal per-item failure. None of the 20 tests require network calls, an API key, or a running Ollama instance.
+The 9 unit tests in [`tests/test_forecast.py`](tests/test_forecast.py) test timeline construction, binary search cashflow bounds, minimum threshold enforcement, spending change overrides, and safe payment date discovery using synthetic timelines. The 12 unit tests in [`tests/test_ai_extraction.py`](tests/test_ai_extraction.py) mock the Groq/Ollama calls to test the Groq-primary/Ollama-fallback routing, image extraction's Ollama-only path, JSON-parsing robustness (markdown fences, malformed numbers, currency-symbol strings), disk-cache invalidation on model change, that a missing `GROQ_API_KEY` always propagates and halts the run, and that Ollama being unavailable degrades gracefully to an unresolved amount instead of crashing. **None of the 21 tests require network calls, an API key, or a running Ollama instance** -- `python -m pytest tests/ -v` works immediately after `pip install -r requirements.txt`, before any environment setup.
 
 ---
 
@@ -258,11 +321,35 @@ Every pipeline execution automatically outputs a token usage report to [`evaluat
 
 | Metric | Value |
 |---|---|
-| Total model calls | 198 |
-| Total input tokens | 155,224 |
-| Total output tokens | 45,169 |
-| Total tokens | 200,393 |
+| Total model calls | 209 |
+| Total input tokens | 164,860 |
+| Total output tokens | 46,449 |
+| Total tokens | 211,309 |
 
-Estimated total cost: $0.0504
+Estimated total cost: $0.0510
 ```
+
+Local Ollama calls are itemized separately in the report's "By model" table (`ollama:<model>`) and always cost `$0.0000 (local)` -- only Groq calls contribute to the estimated total cost.
+
+---
+
+## Troubleshooting
+
+**`RuntimeError: GROQ_API_KEY is not set.`**
+This is fatal and by design -- create a `.env` file (see [Quick Start](#quick-start)) or `export GROQ_API_KEY=...`. Nothing runs without it; there's no way to fall back to Ollama for this, since Groq is required for text extraction's primary path and the pipeline checks for the key up front, before processing any request.
+
+**`WARNING: Could not reach local Ollama at http://localhost:11434/v1 ...`**
+Expected and harmless if you skipped installing Ollama -- the run still completes; the affected image's amount is left as `None` in the output. To resolve it: install [Ollama](https://ollama.com/download), run `ollama serve` if it isn't already running as a background service, then `ollama pull llava-phi3` (and optionally `ollama pull llama3.1:8b` for the text fallback). Re-running the pipeline afterward will pick up the previously-unresolved images automatically -- they are deliberately not cached as permanent failures.
+
+**A row in `output.csv` shows `"ERROR during processing: ..."` in `decision_explanation`**
+This means an *unexpected* exception occurred for that specific request (not a missing key or unavailable Ollama -- both of those degrade gracefully instead, see above) -- e.g. a malformed dataset row. The full run continues for every other request regardless; check the printed error list at the end of the run (`N requests hit errors: ...`) for the specific exception message per `request_id`.
+
+**Pipeline runs but is slow on the image-extraction step**
+Local CPU-only vision inference (via Ollama) is meaningfully slower than a cloud API call -- expect several seconds per image the first time each of the 16 receipt images is processed. Every subsequent run reuses `.image_extraction_cache.json` and adds no additional latency.
+
+**Tests fail or error out**
+The 21 tests in `tests/` mock every AI call and need no API key, no Ollama, and no network access. A failure there points to a real code issue, not an environment/setup gap -- run `python -m pytest tests/ -v` for the specific failing test and assertion.
+
+**Want to skip Ollama installation entirely and just see the pipeline run**
+It already works that way by default -- see [Quick Start](#quick-start) step 3. Just be aware `amount_safe_to_pay` and downstream decisions for the 16 image-linked requests (see [Dataset Layout](#dataset-layout)) will reflect a `None`/unresolved receipt amount rather than the real figure.
 

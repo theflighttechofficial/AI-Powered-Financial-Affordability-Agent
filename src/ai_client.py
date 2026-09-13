@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import types
 import urllib.error
@@ -38,6 +39,73 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from groq import Groq
+
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def strip_json_fences(text: str) -> str:
+    """
+    Strips a leading/trailing markdown code fence (``` or ```json)
+    around a JSON response, if present. Smaller/local models (observed
+    with Ollama's llava-phi3) are much more prone to wrapping strict-
+    JSON responses in a code fence than Groq's cloud models are, even
+    when explicitly told to return only JSON -- without this, every
+    such response fails json.loads and gets treated as a genuine
+    per-call extraction failure.
+    """
+    return _JSON_FENCE_RE.sub("", text.strip()).strip()
+
+
+# Matches an unquoted "amount" value written with thousands-separator
+# commas, e.g. "amount": 431,896,027.35 -- valid to a human, but
+# invalid JSON (a bare number can't contain commas). Observed from
+# llava-phi3; not something a prompt tweak reliably prevents from a
+# small local model, so it's sanitized here instead.
+_UNQUOTED_AMOUNT_COMMA_RE = re.compile(
+    r'"amount"\s*:\s*(-?\d{1,3}(?:,\d{1,3})+(?:\.\d+)?)(?=\s*[,}\]])'
+)
+
+
+def sanitize_unquoted_amount_commas(text: str) -> str:
+    """
+    Rewrites an unquoted, comma-grouped "amount" number (invalid JSON)
+    into a valid bare number by removing the internal commas, so
+    json.loads can parse the rest of the response normally. A quoted
+    amount string (e.g. "amount": "$1,065,872") is left alone here --
+    that's valid JSON already, and its commas/currency symbols are
+    stripped later by coerce_amount instead.
+    """
+    return _UNQUOTED_AMOUNT_COMMA_RE.sub(
+        lambda m: '"amount": ' + m.group(1).replace(",", ""), text
+    )
+
+
+_NON_NUMERIC_RE = re.compile(r"[^\d.\-]")
+
+
+def coerce_amount(value) -> float | None:
+    """
+    Coerces a model's "amount" field into a float, tolerating the
+    formats small/local models are prone to emitting despite being
+    told to return a bare JSON number: a currency-symbol-prefixed
+    string, thousands-separator commas inside a string, or a genuine
+    number/None. Returns None for anything that isn't recoverably a
+    number, rather than raising -- callers already treat None as "no
+    amount found", which is the right fallback here too.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = _NON_NUMERIC_RE.sub("", value)
+        if cleaned in ("", "-", "."):
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
 
 
 def _load_dotenv():
@@ -75,7 +143,17 @@ DEFAULT_MODEL = os.environ.get("BUY_OR_WAIT_MODEL", "openai/gpt-oss-120b")
 # same message/response shape used for Groq is reused as-is.
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_TEXT_MODEL = os.environ.get("OLLAMA_TEXT_MODEL", "llama3.1:8b")
-OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "llama3.2-vision")
+# moondream (~829MB, the smallest vision model in Ollama's library) was
+# tried first but is a confirmed dead end: it returns an empty
+# response for every image-containing prompt on this Ollama version,
+# both through the OpenAI-compatible endpoint and Ollama's native
+# /api/chat and /api/generate -- a known, longstanding issue (see
+# ollama/ollama#4063, #6365; vikhyat/moondream#151), not specific to
+# this dataset or setup. llava-phi3 (~2.9GB) is the next-smallest
+# option and uses the mainline LLaVA architecture, which has been
+# stable in Ollama for a long time. Override OLLAMA_VISION_MODEL for a
+# larger/more accurate model (e.g. llama3.2-vision, ~8GB) if needed.
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "llava-phi3")
 
 
 @dataclass
@@ -195,18 +273,40 @@ def _response_from_openai_json(data: dict):
     )
 
 
-def call_ollama(purpose: str, model: str, messages: list, max_tokens: int = 300):
+class OllamaUnavailableError(RuntimeError):
+    """
+    Raised when the local Ollama instance can't be reached at all
+    (not installed, not running, or the target model not pulled) --
+    distinct from a generic RuntimeError so callers can tell "this
+    environment doesn't have Ollama set up" (an anticipated, gracefully
+    handled gap -- e.g. a CI/grading sandbox with no local Ollama)
+    apart from a genuine, unexpected config error that should still
+    halt the run loudly.
+    """
+
+
+def call_ollama(purpose: str, model: str, messages: list, max_tokens: int = 300, temperature: float = 0):
     """
     Calls a local Ollama instance directly via its OpenAI-compatible
     endpoint, using only the standard library (urllib) so this doesn't
     pull in a new dependency just to talk to a local process. Raises
-    RuntimeError if Ollama isn't reachable -- that's a configuration/
-    environment problem (Ollama not installed/running, or the model
-    not pulled), not a per-call extraction failure, so callers should
-    let it propagate rather than caching it as a normal "no result".
+    OllamaUnavailableError if Ollama isn't reachable at all (not
+    installed, not running, or the model not pulled).
+
+    temperature defaults to 0: these are structured-JSON extraction
+    calls, not creative generation, and smaller local vision models
+    (observed with llava-phi3) are prone to giving wildly different
+    numeric answers for the same image across repeated calls at the
+    default temperature -- 0 substantially reduces (though doesn't
+    fully eliminate) that variance.
     """
     body = json.dumps(
-        {"model": model, "messages": messages, "max_tokens": max_tokens}
+        {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
     ).encode("utf-8")
     req = urllib.request.Request(
         f"{OLLAMA_BASE_URL}/chat/completions",
@@ -218,7 +318,7 @@ def call_ollama(purpose: str, model: str, messages: list, max_tokens: int = 300)
         with urllib.request.urlopen(req, timeout=180) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-        raise RuntimeError(
+        raise OllamaUnavailableError(
             f"Could not reach local Ollama at {OLLAMA_BASE_URL} for model "
             f"'{model}' ({e}). Install/start Ollama and `ollama pull {model}`."
         ) from e

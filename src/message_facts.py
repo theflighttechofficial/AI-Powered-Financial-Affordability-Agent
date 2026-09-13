@@ -27,7 +27,14 @@ from typing import Optional
 
 import pandas as pd
 
-from .ai_client import DEFAULT_MODEL, call_text_with_fallback
+from .ai_client import (
+    DEFAULT_MODEL,
+    OllamaUnavailableError,
+    call_text_with_fallback,
+    coerce_amount,
+    sanitize_unquoted_amount_commas,
+    strip_json_fences,
+)
 
 FACT_TYPES = [
     "salary_amount_change",
@@ -158,15 +165,28 @@ def extract_fact(message_id: str, user_id: str, text: str) -> MessageFact:
             ],
         )
         content = response.choices[0].message.content
-        parsed = json.loads(content.strip())
+        cleaned = sanitize_unquoted_amount_commas(strip_json_fences(content))
+        parsed = json.loads(cleaned)
         if parsed.get("fact_type") not in FACT_TYPES:
             parsed["fact_type"] = "no_op"
+        parsed["amount"] = coerce_amount(parsed.get("amount"))
+    except OllamaUnavailableError as e:
+        # Groq failed AND the local Ollama fallback isn't reachable
+        # either (not installed, not running, or the fallback model
+        # not pulled) -- an anticipated environment gap (e.g. a
+        # grading sandbox with no local Ollama, or the fallback model
+        # simply not pulled yet), not a bug. Degrade this one message
+        # to no_op with a loud warning instead of erroring the whole
+        # request over it -- matches image_extraction.py's handling of
+        # the same condition. Deliberately not cached (see below).
+        print(f"WARNING: {e} -- message {message_id} fact left unresolved (no_op).")
+        return MessageFact(message_id, user_id, "no_op", raw_text=text)
     except RuntimeError:
-        # Missing/invalid GROQ_API_KEY, or both Groq and the local
-        # Ollama fallback failed -- a configuration/environment error,
-        # not a per-message extraction failure. Must not be silently
-        # cached as a no_op fact; let it propagate so the pipeline
-        # stops instead of mass-producing bogus no_ops.
+        # Missing/invalid GROQ_API_KEY -- a fatal configuration error
+        # (also checked once up front in pipeline.py before any
+        # request is processed). Must not be silently cached as a
+        # no_op fact; let it propagate so the run stops loudly instead
+        # of mass-producing bogus no_ops.
         raise
     except Exception:  # noqa: BLE001 -- genuine per-call API/parsing failure -> safest fallback is no_op
         parsed = {
